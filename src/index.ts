@@ -112,13 +112,33 @@ class AggregateOrQueryCommandReplayer<T> {
   toAggregate(
     model: Model<T>,
     regularAggregate: PipelineStage[],
-    additionalAggregates: PipelineStage[] = []
+    additionalAggregates: PipelineStage.FacetPipelineStage[] = []
   ): Aggregate<T[]> {
-    const stages: PipelineStage[] = this.currentCommandsAsFacetPipelineStages();
+    const stages: PipelineStage.FacetPipelineStage[] =
+      this.currentCommandsAsFacetPipelineStages();
     return model.aggregate<T>([
       ...regularAggregate,
-      ...stages,
-      ...additionalAggregates,
+      {
+        $facet: {
+          count: [
+            {
+              $group: {
+                _id: null,
+                count: {
+                  $sum: 1,
+                },
+              },
+            },
+            {
+              $project: {
+                _id: 0,
+                count: "$count",
+              },
+            },
+          ],
+          results: [...stages, ...additionalAggregates],
+        },
+      },
     ]);
   }
 
@@ -712,11 +732,6 @@ async function getCountedPageInfo<T>(
     pagingInfo.after
   ).toAggregate(model, userAggregates);
 
-  console.dir(
-    { pq: pseudoQuery.currentCommandsAsFacetPipelineStages() },
-    { depth: 5 }
-  );
-
   const edgesLength = (
     (await edges
       .limit(Math.max(pagingInfo.first ?? 0, pagingInfo.last ?? 0) + 1)
@@ -821,33 +836,31 @@ export function aggregateRelayPaginate<T>(
 
 export function countedRelayPaginate<T>(
   model: Model<T>,
-  aggregate: PipelineStage.Match,
-  sort?: PipelineStage.Sort,
+  aggregate: PipelineStage[],
   { ...pagingInfo }: MongooseRelayPaginateInfoOnModel<T> = {}
 ): {
   then: Aggregate<RelayResult<T[]>>["then"];
 } {
   const pseudoQuery = new AggregateOrQueryCommandReplayer<T>();
-  const originalSort = {
-    ...sort,
-    _id: -1,
+  const originalSort: PipelineStage.Sort["$sort"] = [...aggregate]
+    .reverse()
+    .find((x): x is PipelineStage.Sort => "$sort" in x)?.["$sort"] ?? {
+    _id: 1,
   };
   edgesToReturn(pseudoQuery, pagingInfo, {
     originalSort,
   });
 
-  console.log(`yo2: bs`);
-  console.dir(pseudoQuery.currentCommandsAsFacetPipelineStages(), { depth: 5 });
-
-  const nodes: Aggregate<T[]> = pseudoQuery.toAggregate(model, [
-    aggregate,
-  ]) as unknown as Aggregate<T[]>;
+  const countedNodes: Aggregate<T[]> = pseudoQuery.toAggregate(
+    model,
+    aggregate
+  ) as unknown as Aggregate<T[]>;
 
   return {
     then(resolve, reject) {
-      return getCountedPageInfo(originalSort, pagingInfo, model, [aggregate])
+      return getAggregatePageInfo(originalSort, pagingInfo, model, aggregate)
         .then(async ({ sortKeys, ...pageInfo }) => {
-          const _nodes = await nodes;
+          const _nodes = await countedNodes;
           return relayResultFromNodes(sortKeys, pageInfo, _nodes);
         })
         .then(resolve, reject);
@@ -886,9 +899,11 @@ export function relayResultFromNodes<Node>(
     hasNextPage,
     hasPreviousPage,
   }: Pick<RelayResult<Node[]>["pageInfo"], "hasNextPage" | "hasPreviousPage">,
-  nodes: Node[]
+  nodes: Node[],
+  count?: number
 ): RelayResult<Node[]> {
   return {
+    ...{ totalCount: count },
     edges: nodes.map((node) => ({
       node: node,
       cursor: toCursorFromKeys(cursorKeys, node),
@@ -1085,7 +1100,7 @@ export function relayPaginatePlugin({ maxLimit = 100 }: PluginOptions = {}) {
         aggregate: PipelineStage.Match,
         paging: MongooseRelayPaginateInfo<any> /* eslint-disable-line */
       ) {
-        return countedRelayPaginate(this, aggregate, undefined, {
+        return countedRelayPaginate(this, [aggregate], {
           ...paging,
           first: paging?.first ? Math.min(paging.first, maxLimit) : undefined,
           last: paging?.last ? Math.min(paging.last, maxLimit) : undefined,
