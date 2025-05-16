@@ -363,6 +363,7 @@ export interface RelayResult<Nodes extends unknown[]> {
     endCursor?: PagingCursor<ElementOfArray<Nodes>> | null;
     startCursor?: PagingCursor<ElementOfArray<Nodes>> | null;
   };
+  totalCount?: number;
 }
 
 export interface TransformedRelayResult<
@@ -498,7 +499,6 @@ export function relayPaginate<T>(
     _id: 1,
   };
 
-  console.log(`NON-aggie: doing stuff`);
   return paginator<T>(
     {
       ...pagingInfo,
@@ -511,8 +511,11 @@ export function relayPaginate<T>(
   )
     .toQuery(query.clone())
     .transform(async (_nodes) => {
-      const { sortKeys, hasNextPage, hasPreviousPage, count } =
-        await getPageInfo<T>(sort, pagingInfo, query);
+      const { sortKeys, hasNextPage, hasPreviousPage } = await getPageInfo<T>(
+        sort,
+        pagingInfo,
+        query
+      );
 
       const nodes = _nodes as unknown as MongooseRelayDocument<
         DefaultRelayQuery<T>
@@ -523,8 +526,7 @@ export function relayPaginate<T>(
           hasNextPage,
           hasPreviousPage,
         },
-        nodes,
-        count
+        nodes
       );
     }) as QueryWithHelpers<
     Promise<RelayResult<MongooseRelayDocument<DefaultRelayQuery<T>>[]>>,
@@ -558,7 +560,9 @@ async function getPageInfo<T>(
     pagingInfo.before,
     pagingInfo.after
   ).toQuery(query.clone());
-  const count = await query.model.find(query.getFilter()).countDocuments();
+  // const count = await query.model
+  //   .find(query.getFilter())
+  //   .estimatedDocumentCount();
 
   const edgesLength = await edges
     .limit(Math.max(pagingInfo?.first ?? 0, pagingInfo?.last ?? 0) + 1)
@@ -605,7 +609,7 @@ async function getPageInfo<T>(
     }
     return returnValue;
   })();
-  return { sortKeys, hasNextPage, hasPreviousPage, count };
+  return { sortKeys, hasNextPage, hasPreviousPage };
 }
 
 async function getAggregatePageInfo<T>(
@@ -680,7 +684,82 @@ async function getAggregatePageInfo<T>(
     }
     return returnValue;
   })();
-  return { sortKeys, hasNextPage, hasPreviousPage, edgesLength };
+  return { sortKeys, hasNextPage, hasPreviousPage };
+}
+
+async function getCountedPageInfo<T>(
+  sort: Record<string, unknown>,
+  pagingInfo: {
+    /** fetch the `first` given number of records */
+    first?: number | undefined;
+    /** fetch the `last` given number of records */
+    last?: number | undefined;
+    /** fetch `after` the given record's cursor */
+    after?: PagingCursor<T> | null | undefined;
+    /** fetch `before` the given record's cursor */
+    before?: PagingCursor<T> | null | undefined;
+  },
+  model: Model<T>,
+  userAggregates: PipelineStage[]
+) {
+  const sortKeys = Object.keys(sort) as (keyof unknown)[];
+
+  const pseudoQuery = new AggregateOrQueryCommandReplayer<T>();
+  const edges = applyCursorsToEdges<T>(
+    pseudoQuery,
+    sort,
+    pagingInfo.before,
+    pagingInfo.after
+  ).toAggregate(model, userAggregates);
+
+  const edgesLength = (
+    (await edges
+      .limit(Math.max(pagingInfo.first ?? 0, pagingInfo.last ?? 0) + 1)
+      .count("count")) as unknown as [{ count: number }]
+  )?.[0]?.count;
+  ///
+  const hasNextPage = await (async function () {
+    let returnValue = false;
+    if (typeof pagingInfo.first === "number") {
+      returnValue = edgesLength > pagingInfo.first;
+    }
+    if (!returnValue && pagingInfo.before) {
+      returnValue =
+        (
+          await paginator<T>(
+            {
+              first: 1,
+              after: pagingInfo.before,
+            },
+            sort,
+            true
+          ).toAggregate(model, userAggregates)
+        ).length > 0;
+    }
+    return returnValue;
+  })();
+
+  const hasPreviousPage = await (async function () {
+    let returnValue = false;
+    if (typeof pagingInfo.last === "number") {
+      returnValue = edgesLength > pagingInfo.last;
+    }
+    if (!returnValue && pagingInfo.after) {
+      returnValue =
+        (
+          await paginator<T>(
+            {
+              first: 1,
+              before: pagingInfo.after,
+            },
+            sort,
+            true
+          ).toAggregate(model, userAggregates)
+        ).length > 0;
+    }
+    return returnValue;
+  })();
+  return { sortKeys, hasNextPage, hasPreviousPage };
 }
 
 /** This is an implementation of the relay pagination algorithm for mongoose. This algorithm and pagination format
@@ -720,22 +799,35 @@ export function aggregateRelayPaginate<T>(
     aggregate
   ) as unknown as Aggregate<T[]>;
 
-  console.log(`aggie: doing stuff`);
-
   return {
     toNodesAggregate<AggregateResult = T[]>() {
       return nodes as unknown as Aggregate<AggregateResult>;
     },
     then(resolve, reject) {
       return getAggregatePageInfo(originalSort, pagingInfo, model, aggregate)
-        .then(async ({ sortKeys, edgesLength, ...pageInfo }) => {
+        .then(async ({ sortKeys, ...pageInfo }) => {
           const _nodes = await nodes;
-          console.log("aggie edgesLength: ", edgesLength);
           return relayResultFromNodes(sortKeys, pageInfo, _nodes);
         })
         .then(resolve, reject);
     },
   };
+}
+
+export function countedRelayPaginate<T>(
+    model: Model<T>,
+    aggregate: PipelineStage.Match,
+    { ...pagingInfo }: MongooseRelayPaginateInfoOnModel<T> = {}
+): {
+    then: Aggregate<RelayResult<T[]>>["then"];
+} {
+    const pseudoQuery = new AggregateOrQueryCommandReplayer<T>();
+
+
+    return {
+        then(resolve, reject) {
+        }
+    };
 }
 
 export function toCursorFromKeys<Node>(
@@ -769,8 +861,7 @@ export function relayResultFromNodes<Node>(
     hasNextPage,
     hasPreviousPage,
   }: Pick<RelayResult<Node[]>["pageInfo"], "hasNextPage" | "hasPreviousPage">,
-  nodes: Node[],
-  count?: number
+  nodes: Node[]
 ): RelayResult<Node[]> {
   return {
     edges: nodes.map((node) => ({
@@ -785,7 +876,6 @@ export function relayResultFromNodes<Node>(
         ? toCursorFromKeys(cursorKeys, nodes[nodes.length - 1])
         : null,
       startCursor: nodes[0] ? toCursorFromKeys(cursorKeys, nodes[0]) : null,
-      ...{ count },
     },
   };
 }
@@ -917,6 +1007,14 @@ export interface RelayPaginateStatics {
     >() => Aggregate<AggregateResult>;
     then: Aggregate<RelayResult<ModelRawDocType<M>[]>>["then"];
   };
+
+  countedRelayPaginate<M extends Model<any> /* eslint-disable-line */>(
+    this: M,
+    aggregate: PipelineStage.Match,
+    paginateInfo?: Partial<MongooseRelayPaginateInfoOnModel<ModelRawDocType<M>>>
+  ): {
+    then: Aggregate<RelayResult<ModelRawDocType<M>[]>>["then"];
+  };
 }
 // }
 
@@ -952,6 +1050,17 @@ export function relayPaginatePlugin({ maxLimit = 100 }: PluginOptions = {}) {
         paging: MongooseRelayPaginateInfo<any> /* eslint-disable-line */
       ) {
         return aggregateRelayPaginate(this, aggregate, {
+          ...paging,
+          first: paging?.first ? Math.min(paging.first, maxLimit) : undefined,
+          last: paging?.last ? Math.min(paging.last, maxLimit) : undefined,
+        });
+      };
+    (schema.statics as any) /* eslint-disable-line */.countedRelayPaginate =
+      function (
+        aggregate: PipelineStage.Match,
+        paging: MongooseRelayPaginateInfo<any> /* eslint-disable-line */
+      ) {
+        return countedRelayPaginate(this, aggregate, {
           ...paging,
           first: paging?.first ? Math.min(paging.first, maxLimit) : undefined,
           last: paging?.last ? Math.min(paging.last, maxLimit) : undefined,
