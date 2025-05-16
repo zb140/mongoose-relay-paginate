@@ -498,6 +498,7 @@ export function relayPaginate<T>(
     _id: 1,
   };
 
+  console.log(`NON-aggie: doing stuff`);
   return paginator<T>(
     {
       ...pagingInfo,
@@ -510,11 +511,8 @@ export function relayPaginate<T>(
   )
     .toQuery(query.clone())
     .transform(async (_nodes) => {
-      const { sortKeys, hasNextPage, hasPreviousPage } = await getPageInfo<T>(
-        sort,
-        pagingInfo,
-        query
-      );
+      const { sortKeys, hasNextPage, hasPreviousPage, count } =
+        await getPageInfo<T>(sort, pagingInfo, query);
 
       const nodes = _nodes as unknown as MongooseRelayDocument<
         DefaultRelayQuery<T>
@@ -525,7 +523,8 @@ export function relayPaginate<T>(
           hasNextPage,
           hasPreviousPage,
         },
-        nodes
+        nodes,
+        count
       );
     }) as QueryWithHelpers<
     Promise<RelayResult<MongooseRelayDocument<DefaultRelayQuery<T>>[]>>,
@@ -559,9 +558,7 @@ async function getPageInfo<T>(
     pagingInfo.before,
     pagingInfo.after
   ).toQuery(query.clone());
-  // const count = await query.model
-  //   .find(query.getFilter())
-  //   .estimatedDocumentCount();
+  const count = await query.model.find(query.getFilter()).countDocuments();
 
   const edgesLength = await edges
     .limit(Math.max(pagingInfo?.first ?? 0, pagingInfo?.last ?? 0) + 1)
@@ -608,7 +605,7 @@ async function getPageInfo<T>(
     }
     return returnValue;
   })();
-  return { sortKeys, hasNextPage, hasPreviousPage };
+  return { sortKeys, hasNextPage, hasPreviousPage, count };
 }
 
 async function getAggregatePageInfo<T>(
@@ -683,7 +680,7 @@ async function getAggregatePageInfo<T>(
     }
     return returnValue;
   })();
-  return { sortKeys, hasNextPage, hasPreviousPage };
+  return { sortKeys, hasNextPage, hasPreviousPage, edgesLength };
 }
 
 /** This is an implementation of the relay pagination algorithm for mongoose. This algorithm and pagination format
@@ -723,14 +720,17 @@ export function aggregateRelayPaginate<T>(
     aggregate
   ) as unknown as Aggregate<T[]>;
 
+  console.log(`aggie: doing stuff`);
+
   return {
     toNodesAggregate<AggregateResult = T[]>() {
       return nodes as unknown as Aggregate<AggregateResult>;
     },
     then(resolve, reject) {
       return getAggregatePageInfo(originalSort, pagingInfo, model, aggregate)
-        .then(async ({ sortKeys, ...pageInfo }) => {
+        .then(async ({ sortKeys, edgesLength, ...pageInfo }) => {
           const _nodes = await nodes;
+          console.log("aggie edgesLength: ", edgesLength);
           return relayResultFromNodes(sortKeys, pageInfo, _nodes);
         })
         .then(resolve, reject);
@@ -769,7 +769,8 @@ export function relayResultFromNodes<Node>(
     hasNextPage,
     hasPreviousPage,
   }: Pick<RelayResult<Node[]>["pageInfo"], "hasNextPage" | "hasPreviousPage">,
-  nodes: Node[]
+  nodes: Node[],
+  count?: number
 ): RelayResult<Node[]> {
   return {
     edges: nodes.map((node) => ({
@@ -784,6 +785,7 @@ export function relayResultFromNodes<Node>(
         ? toCursorFromKeys(cursorKeys, nodes[nodes.length - 1])
         : null,
       startCursor: nodes[0] ? toCursorFromKeys(cursorKeys, nodes[0]) : null,
+      ...{ count },
     },
   };
 }
