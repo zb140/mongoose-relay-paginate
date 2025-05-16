@@ -822,22 +822,23 @@ export function aggregateRelayPaginate<T>(
 export function countedRelayPaginate<T>(
   model: Model<T>,
   aggregate: PipelineStage.Match,
+  sort?: PipelineStage.Sort,
   { ...pagingInfo }: MongooseRelayPaginateInfoOnModel<T> = {}
 ): {
   then: Aggregate<RelayResult<T[]>>["then"];
 } {
   const pseudoQuery = new AggregateOrQueryCommandReplayer<T>();
-  /*
-    const originalSort: PipelineStage.Sort["$sort"] = [aggregate]
-        .reverse()
-        .find((x): x is PipelineStage.Sort => "$sort" in x)?.["$sort"] ?? {
-            _id: 1,
-        };
-        */
-  const originalSort = {};
+  const originalSort = {
+    ...sort,
+    _id: -1,
+  };
   edgesToReturn(pseudoQuery, pagingInfo, {
     originalSort,
   });
+
+  console.log(`yo2: bs`);
+  console.dir(pseudoQuery.currentCommandsAsFacetPipelineStages(), { depth: 5 });
+
   const nodes: Aggregate<T[]> = pseudoQuery.toAggregate(model, [
     aggregate,
   ]) as unknown as Aggregate<T[]>;
@@ -1084,7 +1085,7 @@ export function relayPaginatePlugin({ maxLimit = 100 }: PluginOptions = {}) {
         aggregate: PipelineStage.Match,
         paging: MongooseRelayPaginateInfo<any> /* eslint-disable-line */
       ) {
-        return countedRelayPaginate(this, aggregate, {
+        return countedRelayPaginate(this, aggregate, undefined, {
           ...paging,
           first: paging?.first ? Math.min(paging.first, maxLimit) : undefined,
           last: paging?.last ? Math.min(paging.last, maxLimit) : undefined,
